@@ -471,14 +471,20 @@ class PluginContext:
 
     # -- message injection --------------------------------------------------
 
-    def inject_message(self, content: str, role: str = "user") -> bool:
+    def inject_message(self, content: str, role: str = "user", mode: str = "interrupt") -> bool:
         """Inject a message into the active conversation.
 
         If the agent is idle (waiting for user input), this starts a new turn.
-        If the agent is running, this interrupts and injects the message.
+        If the agent is running, ``mode`` controls delivery:
+          - ``"interrupt"`` (default, legacy) — preempt the current turn.
+          - ``"queue"`` — do NOT interrupt; the message waits in the pending-input
+            queue and is picked up at the next turn boundary (non-interrupting).
+        When the agent is idle there is nothing to interrupt, so every mode simply
+        queues the message as the next input.
 
-        This enables plugins (e.g. remote control viewers, messaging bridges)
-        to send messages into the conversation from external sources.
+        This enables plugins (e.g. remote control viewers, messaging bridges) to
+        send messages into the conversation from external sources at a chosen
+        interruption level. The default preserves the historical behavior.
 
         Returns True if the message was queued successfully.
         """
@@ -489,11 +495,11 @@ class PluginContext:
 
         msg = content if role == "user" else f"[{role}] {content}"
 
-        if getattr(cli, "_agent_running", False):
-            # Agent is mid-turn — interrupt with the message
+        if getattr(cli, "_agent_running", False) and mode != "queue":
+            # Agent is mid-turn and interrupt requested — preempt with the message
             cli._interrupt_queue.put(msg)
         else:
-            # Agent is idle — queue as next input
+            # Idle (nothing to interrupt) or queue mode — surface at the next turn
             cli._pending_input.put(msg)
         return True
 
