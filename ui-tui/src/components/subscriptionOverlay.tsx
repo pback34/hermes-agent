@@ -675,12 +675,15 @@ function ResultScreen({ onClose, overlay, t }: Omit<ScreenProps, 'onPatch'>) {
 function StepUpScreen({ onPatch, overlay, t }: ScreenProps) {
   const { ctx } = overlay
   const retry: null | SubscriptionStepUpRetry = overlay.stepUpRetry ?? null
-  const [phase, setPhase] = useState<'granted' | 'prompt' | 'waiting'>('prompt')
+  const [phase, setPhase] = useState<'granted' | 'prompt' | 'resuming' | 'waiting'>('prompt')
   const startedRef = useRef(false)
   // Set when the user cancels while the browser grant is still in flight. The
   // grant's late `.then` MUST NOT fire the held change after a cancel — otherwise
   // a cancel-then-approve charges the card the user just declined.
   const abortedRef = useRef(false)
+  // Guards the post-grant replay from double-firing (double-Enter on the default
+  // 'Continue' row) — mirrors billingOverlay.resume()'s phase flip.
+  const resumingRef = useRef(false)
 
   const enable = () => {
     if (startedRef.current) {
@@ -708,6 +711,15 @@ function StepUpScreen({ onPatch, overlay, t }: ScreenProps) {
   }
 
   const resume = () => {
+    // Fire the held replay at most once. Without this, a double-Enter on the
+    // default 'Continue' row sends two mutations (the upgrade dedups on the shared
+    // idempotency key, but schedule/cancel/resume replays carry none).
+    if (resumingRef.current || phase !== 'granted') {
+      return
+    }
+
+    resumingRef.current = true
+    setPhase('resuming')
     onPatch({ stepUpRetry: null })
 
     if (!retry) {
@@ -726,6 +738,12 @@ function StepUpScreen({ onPatch, overlay, t }: ScreenProps) {
   }
 
   const back = () => {
+    // Once a replay is firing, block abandon — the mutation/charge is in flight and
+    // re-mounting confirm would let a second submit through.
+    if (resumingRef.current) {
+      return
+    }
+
     // Abandon. If a grant is in flight, mark it aborted so its .then no-ops (no
     // un-consented charge); if already granted, just leave without replaying.
     abortedRef.current = true
@@ -756,12 +774,13 @@ function StepUpScreen({ onPatch, overlay, t }: ScreenProps) {
         <Text color={t.color.muted}>Opening your browser to approve… finish there, then come back — nothing is charged until you continue.</Text>
       )}
       {phase === 'granted' && <Text color={t.color.ok}>Terminal billing enabled. Continue to finish your change.</Text>}
+      {phase === 'resuming' && <Text color={t.color.muted}>Applying your change…</Text>}
       <Text />
       {rows.map((row, i) => (
         <ActionRow active={sel === i} color={row.color} key={row.label} label={row.label} t={t} />
       ))}
       <Text />
-      {footer(phase === 'waiting' ? 'Waiting for approval… · Esc to cancel' : '↑/↓ select · Enter · Esc back', t)}
+      {footer(phase === 'waiting' ? 'Waiting for approval… · Esc to cancel' : phase === 'resuming' ? 'Working…' : '↑/↓ select · Enter · Esc back', t)}
     </Box>
   )
 }
