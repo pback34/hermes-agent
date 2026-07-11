@@ -120,6 +120,7 @@ export const ja = defineLocale({
     backendOutOfDateTitle: 'バックエンドが古いです',
     backendOutOfDateMessage:
       'Hermes バックエンドがこのデスクトップビルドより古く、正常に動作しない場合があります。更新して揃えてください。',
+    installMethodUnsupportedTitle: 'サポート対象外のインストール方法',
     updateHermes: 'Hermes を更新',
     updateReadyTitle: '更新の準備ができました',
     updateReadyMessage: count => `${count} 件の新しい変更が利用可能です。`,
@@ -1874,6 +1875,10 @@ export const ja = defineLocale({
     featuredPitch: '1 つのサブスクリプションで 300 以上の最先端モデル — Hermes を実行するための推奨方法',
     openRouterPitch: '1 つのキーで数百のモデル — 堅実なデフォルト',
     apiKeyOptions: {
+      fireworks: {
+        short: 'モデル API に直接接続',
+        description: 'Fireworks AI がホストするモデルに直接アクセスします。'
+      },
       openrouter: {
         short: '1 つのキーで多くのモデル',
         description: '1 つのキーで数百のモデルをホスト。新規インストールのデフォルトとして最適。'
