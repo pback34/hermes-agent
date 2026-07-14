@@ -1276,7 +1276,7 @@ Control how much "thinking" the model does before responding:
 
 ```yaml
 agent:
-  reasoning_effort: ""   # empty = medium (default). Options: none, minimal, low, medium, high, xhigh (max)
+  reasoning_effort: ""   # empty = medium. Options: none, minimal, low, medium, high, xhigh, max, ultra
 ```
 
 When unset (default), reasoning effort defaults to "medium" — a balanced level that works well for most tasks. Setting a value overrides it — higher reasoning effort gives better results on complex tasks at the cost of more tokens and latency.
@@ -1285,10 +1285,9 @@ When unset (default), reasoning effort defaults to "medium" — a balanced level
 These models use *adaptive* thinking and don't accept the usual `reasoning.effort`
 field — OpenRouter ignores it for them. Hermes transparently routes your
 `reasoning_effort` to OpenRouter's `verbosity` parameter instead (which maps to
-Anthropic's `output_config.effort`), so the same `low`/`medium`/`high`/`xhigh`
-knob keeps working — no extra configuration needed. `none` (or unset) leaves the
-model on its own adaptive default. (`max` is accepted on the wire but is not a
-selectable `reasoning_effort` value; `xhigh` is the configurable ceiling.) The
+Anthropic's `output_config.effort`), so the same effort knob keeps working with
+the levels supported by the selected model. `none` (or unset) leaves the model
+on its own adaptive default. The
 native Anthropic provider already controls effort directly and is unaffected.
 :::
 
@@ -1301,6 +1300,37 @@ You can also change the reasoning effort at runtime with the `/reasoning` comman
 /reasoning show      # Show model thinking above each response
 /reasoning hide      # Hide model thinking
 ```
+
+#### Per-Model Reasoning Overrides
+
+You can set different reasoning effort levels for different models. This is useful when you want high reasoning for complex models but medium for faster ones:
+
+```yaml
+agent:
+  reasoning_effort: "medium"       # global default
+  reasoning_overrides:
+    "openrouter/anthropic/claude-opus-4.5": "xhigh"
+    "openai/gpt-5": "low"
+    "claude-sonnet-4.6": "high"    # bare model name also works
+```
+
+The key matching is **spelling-tolerant** — any reasonable spelling will match:
+- `claude-opus-4.5`, `claude-opus-4-5`, `claude-opus.4.5` (dots and dashes are interchangeable)
+- `anthropic/claude-opus-4.5`, `openrouter/anthropic/claude-opus-4.5` (provider prefix optional)
+- Exact matches take precedence over variants
+
+:::note
+There is no `hermes config set` support for `reasoning_overrides` keys — edit the YAML file directly. This is because model names often contain dots (e.g. `claude-opus-4.5`), which conflict with the CLI's dotted-key syntax.
+:::
+
+**Resolution priority:**
+
+1. Session-scoped `/reasoning --session` override (gateway only)
+2. Per-model override from `agent.reasoning_overrides` (spelling-tolerant)
+3. Global `agent.reasoning_effort`
+4. Provider default
+
+The override applies automatically everywhere: CLI startup, messaging gateway, Desktop/TUI, cron jobs, `/model` mid-session switches, and fallback model activation.
 
 ## Tool-Use Enforcement
 
@@ -1447,6 +1477,22 @@ Example footer:
 ```
 
 Set `file_mutation_verifier: false` (or `HERMES_FILE_MUTATION_VERIFIER=0`) to suppress the footer. The verifier only fires when real failures are outstanding at turn end — a model that retries a failed patch and succeeds within the same turn will not trigger it for that file.
+
+**Trust the verifier over the model's summary.** The footer means the listed files were **not** modified on disk, even if the assistant's closing message says the task is done. Common causes:
+
+- **Write denied** — path is on the credential denylist or outside `HERMES_WRITE_SAFE_ROOT` (see [File write safety](./security.md#file-write-safety))
+- **Patch mismatch** — `old_string` did not match the file on disk
+- **Syntax gate** — candidate content failed JSON/YAML/TOML validation before write
+
+Example footer when writes are blocked:
+
+```
+⚠️ File-mutation verifier: 2 file(s) were NOT modified this turn despite any wording above that may suggest otherwise. Run `git status` or `read_file` to confirm.
+  • ~/.hermes/cron/jobs.json — [patch] Write denied: '…' is outside HERMES_WRITE_SAFE_ROOT (/path/to/project)
+  • ~/.hermes/scripts/monitor.py — [write_file] Write denied: '…' is outside HERMES_WRITE_SAFE_ROOT (/path/to/project)
+```
+
+If writes to Hermes state (cron jobs, skills, scripts under `~/.hermes/`) are failing, check whether `HERMES_WRITE_SAFE_ROOT` is set in your environment. For cron changes, use the `cronjob` tool or `hermes cron edit` instead of patching `jobs.json` directly.
 
 ### UI language for static messages
 
@@ -1879,13 +1925,13 @@ Control how Hermes handles potentially dangerous commands:
 
 ```yaml
 approvals:
-  mode: manual   # manual | smart | off
+  mode: smart   # smart | manual | off
 ```
 
 | Mode | Behavior |
 |------|----------|
-| `manual` (default) | Prompt the user before executing any flagged command. In the CLI, shows an interactive approval dialog. In messaging, queues a pending approval request. |
-| `smart` | Use an auxiliary LLM to assess whether a flagged command is actually dangerous. Low-risk commands are auto-approved with session-level persistence. Genuinely risky commands are escalated to the user. |
+| `smart` (default) | Use an auxiliary LLM to assess whether a flagged command is actually dangerous. Low-risk commands are auto-approved for that command only. Genuinely risky commands are denied; uncertain decisions escalate to the user. |
+| `manual` | Prompt the user before executing any flagged command. In the CLI, shows an interactive approval dialog. In messaging, queues a pending approval request. |
 | `off` | Skip all approval checks. Equivalent to `HERMES_YOLO_MODE=true`. **Use with caution.** |
 
 Smart mode is particularly useful for reducing approval fatigue — it lets the agent work more autonomously on safe operations while still catching genuinely destructive commands.
