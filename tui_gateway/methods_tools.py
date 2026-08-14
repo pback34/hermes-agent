@@ -710,15 +710,19 @@ def _(rid, params: dict) -> dict:
         if not history:
             return _err(rid, 4018, "no previous user message to retry")
         # Walk backwards to the last *real* user turn. Timeline bookkeeping
-        # rows (display_kind set) are durable role=user but no client counts
-        # them as user turns — same predicate as CLI resume/count and the
-        # prompt.submit ordinal fix. Without this, /retry re-sends opaque
-        # markers (model_switch / async_delegation_complete / auto_continue)
-        # and truncates only the marker instead of the failed exchange.
+        # rows (display_kind set) and compaction handoffs are durable
+        # role=user but must not count as user-originated asks — same
+        # predicate as CLI resume/count and the prompt.submit ordinal fix.
+        # Without this, /retry re-sends opaque markers (model_switch /
+        # async_delegation_complete / auto_continue / CONTEXT COMPACTION
+        # handoffs) and truncates only the marker instead of the failed
+        # exchange (#80622).
+        from agent.context_compressor import is_user_originated_turn
+
         last_user_idx = None
         for i in range(len(history) - 1, -1, -1):
             msg = history[i]
-            if msg.get("role") == "user" and not msg.get("display_kind"):
+            if is_user_originated_turn(msg):
                 last_user_idx = i
                 break
         if last_user_idx is None:
@@ -1294,12 +1298,17 @@ def _(rid, params: dict) -> dict:
                 removed = 0
                 with session["history_lock"]:
                     history = session.get("history", [])
-                    # Truncate from the last *real* user turn (no display_kind).
-                    # Same predicate as list_recent_user_messages / /undo / /retry.
+                    # Truncate from the last *real* user turn. Same predicate
+                    # as list_recent_user_messages / /undo / /retry —
+                    # is_user_originated_turn also excludes compaction
+                    # handoffs (durable role=user, sometimes without
+                    # display_kind on legacy sessions; #80622).
+                    from agent.context_compressor import is_user_originated_turn
+
                     last_user_idx = None
                     for i in range(len(history) - 1, -1, -1):
                         msg = history[i]
-                        if msg.get("role") == "user" and not msg.get("display_kind"):
+                        if is_user_originated_turn(msg):
                             last_user_idx = i
                             break
                     if last_user_idx is not None:
@@ -1624,7 +1633,17 @@ def _(rid, params: dict) -> dict:
         from tools.cronjob_tools import cronjob
 
         if action == "list":
-            return _ok(rid, json.loads(cronjob(action="list")))
+            # Paused jobs are excluded by default, which reads as deletion in
+            # any UI with an enable/disable toggle — forward the flag.
+            return _ok(
+                rid,
+                json.loads(
+                    cronjob(
+                        action="list",
+                        include_disabled=is_truthy_value(params.get("include_disabled", False)),
+                    )
+                ),
+            )
         if action == "add":
             return _ok(
                 rid,
@@ -1634,6 +1653,14 @@ def _(rid, params: dict) -> dict:
                         name=jid,
                         schedule=params.get("schedule", ""),
                         prompt=params.get("prompt", ""),
+                        # Optional repeat cap ("run N times"); None keeps the
+                        # schedule-kind default (once for one-shot, forever
+                        # for recurring).
+                        repeat=(
+                            int(params["repeat"])
+                            if str(params.get("repeat", "")).strip().isdigit()
+                            else None
+                        ),
                     )
                 ),
             )
@@ -1704,6 +1731,23 @@ def _(rid, params: dict) -> dict:
 @method("skills.manage")
 def _(rid, params: dict) -> dict:
     action, query = params.get("action", "list"), params.get("query", "")
+    # Optional profile scoping: list/install operate on that profile's
+    # skills dir (capabilities UIs manage a bot's skills from the main
+    # window). Search/browse/inspect hit the shared hub catalog — the
+    # override is harmless there and keeps the semantics uniform.
+    profile = str(params.get("profile") or "").strip()
+    token = None
+    if profile:
+        try:
+            from hermes_cli.profiles import get_profile_dir
+            from hermes_constants import set_hermes_home_override
+
+            profile_dir = get_profile_dir(profile)
+            if not profile_dir or not profile_dir.is_dir():
+                return _err(rid, 4064, f"profile '{profile}' not found")
+            token = set_hermes_home_override(str(profile_dir))
+        except Exception as e:
+            return _err(rid, 5024, str(e))
     try:
         if action == "list":
             from hermes_cli.banner import get_available_skills
@@ -1758,6 +1802,72 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 4017, f"unknown skills action: {action}")
     except Exception as e:
         return _err(rid, 5024, str(e))
+    finally:
+        if token is not None:
+            try:
+                from hermes_constants import reset_hermes_home_override
+
+                reset_hermes_home_override(token)
+            except Exception:
+                pass
+
+
+@method("mcp.catalog")
+def _(rid, params: dict) -> dict:
+    """Bundled MCP catalog with per-profile install/enable state.
+
+    Params: optional ``profile`` (defaults to the launch profile). Result:
+    ``{servers: [{name, description, installed, enabled, requires: [env
+    keys], transport}]}`` — the same catalog `hermes mcp` offers, so
+    capability UIs can present the full menu and know which entries need
+    setup (missing requires) before they'll work.
+    """
+    profile = str(params.get("profile") or "").strip()
+    token = None
+    try:
+        if profile:
+            from hermes_cli.profiles import get_profile_dir
+            from hermes_constants import set_hermes_home_override
+
+            profile_dir = get_profile_dir(profile)
+            if not profile_dir or not profile_dir.is_dir():
+                return _err(rid, 4064, f"profile '{profile}' not found")
+            token = set_hermes_home_override(str(profile_dir))
+
+        from hermes_cli import mcp_catalog
+
+        out = []
+        for entry in mcp_catalog.list_catalog():
+            try:
+                requires = [str(k) for k in (getattr(entry, "env_keys", None) or [])]
+            except Exception:
+                requires = []
+            out.append(
+                {
+                    "name": entry.name,
+                    "description": getattr(entry, "description", "") or "",
+                    "installed": bool(mcp_catalog.is_installed(entry.name)),
+                    "enabled": bool(mcp_catalog.is_enabled(entry.name)),
+                    "requires": requires,
+                    # TransportSpec object — reduce to its kind string.
+                    "transport": str(
+                        getattr(getattr(entry, "transport", None), "kind", "")
+                        or getattr(entry, "transport", "")
+                        or "stdio"
+                    ),
+                }
+            )
+        return _ok(rid, {"servers": out})
+    except Exception as e:
+        return _err(rid, 5024, str(e))
+    finally:
+        if token is not None:
+            try:
+                from hermes_constants import reset_hermes_home_override
+
+                reset_hermes_home_override(token)
+            except Exception:
+                pass
 
 
 @method("skills.reload")
@@ -1794,17 +1904,19 @@ def _(rid, params: dict) -> dict:
     agree on what's installed and what's enabled.
 
     Actions:
-      - ``list``   → {"plugins": [{name, version, description, source,
-                       status}], "user_count": N, "bundled_count": M}
-      - ``toggle`` → flip ``name`` based on ``enable`` (bool). Returns the
-                       refreshed row plus {"ok", "unchanged"}.
+      - ``list``   → {"plugins": [{name, key, version, description, source,
+                       status, portable}], "user_count": N, "bundled_count": M}
+      - ``toggle`` → flip ``key`` (or ``name``) based on ``enable`` (bool).
+                       Returns the refreshed row plus {"ok", "unchanged"}.
     """
     action = params.get("action", "list")
     try:
         from hermes_cli.plugins_cmd import (
+            _bundled_default_on,
             _discover_all_plugins,
             _get_disabled_set,
             _get_enabled_set,
+            _is_portable_plugin_dir,
             _plugin_status,
         )
 
@@ -1815,13 +1927,31 @@ def _(rid, params: dict) -> dict:
             for name, version, desc, source, _dir, key in sorted(
                 _discover_all_plugins()
             ):
+                status = _plugin_status(name, enabled, disabled, key=key)
+                # Bundled backends/platforms/providers are active without an
+                # explicit enable (they "just work" — plugins.py). Reporting
+                # them "not enabled" reads as OFF in clients when they are in
+                # fact running; surface the truthful default instead.
+                if (
+                    status == "not enabled"
+                    and source == "bundled"
+                    and _bundled_default_on(_dir)
+                ):
+                    status = "enabled"
                 out.append(
                     {
                         "name": name,
+                        # Canonical registry key (e.g. ``image_gen/fal``). Names
+                        # can collide across category dirs — both fal backends
+                        # are named "fal" — so toggles must address the key.
+                        "key": key,
                         "version": str(version or ""),
                         "description": desc or "",
                         "source": source,
-                        "status": _plugin_status(name, enabled, disabled, key=key),
+                        "status": status,
+                        # Agent Plugins v1 package (plugin.json — the portable
+                        # skills/MCP format) vs a native Hermes plugin.
+                        "portable": _is_portable_plugin_dir(_dir),
                     }
                 )
             return out
@@ -1841,20 +1971,24 @@ def _(rid, params: dict) -> dict:
         if action == "toggle":
             from hermes_cli.plugins_cmd import dashboard_set_agent_plugin_enabled
 
-            name = (params.get("name") or "").strip()
-            if not name:
-                return _err(rid, 4019, "plugins.toggle requires a 'name'")
+            # Prefer the canonical key — bare names are ambiguous when two
+            # category plugins share one (image_gen/fal vs video_gen/fal).
+            ident = (params.get("key") or params.get("name") or "").strip()
+            if not ident:
+                return _err(rid, 4019, "plugins.toggle requires a 'key' or 'name'")
             enable = bool(params.get("enable"))
-            result = dashboard_set_agent_plugin_enabled(name, enabled=enable)
+            result = dashboard_set_agent_plugin_enabled(ident, enabled=enable)
             if not result.get("ok"):
                 return _err(rid, 5026, result.get("error") or "toggle failed")
-            row = next((r for r in _rows() if r["name"] == name), None)
+            row = next(
+                (r for r in _rows() if ident in (r["key"], r["name"])), None
+            )
             return _ok(
                 rid,
                 {
                     "ok": True,
                     "unchanged": bool(result.get("unchanged")),
-                    "name": name,
+                    "name": ident,
                     "plugin": row,
                 },
             )
