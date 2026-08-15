@@ -54,6 +54,47 @@ def _safe_int(value: Any) -> int | None:
         return None
 
 
+# Inter-session deliveries are consumed by the live turn. Keeping them in the
+# protected tail makes every later compaction persist another copy. Match the
+# poller's envelope, rather than any occurrence of the words, so a normal user
+# message quoting an inter-session banner is retained.
+_INTER_SESSION_INJECTION_RE = re.compile(
+    r"\A\s*(?:=+\s*)?\[(?:INTERRUPTING )?INTER-SESSION MESSAGE from "
+    r"[^\n]+\(id: \d+(?:, [^\n]*)?\)\]\s*\n"
+)
+
+
+def _is_inter_session_injection(message: Dict[str, Any]) -> bool:
+    """Return True only for a user-role poller-rendered delivery envelope."""
+    if message.get("role") != "user":
+        return False
+    content = message.get("content")
+    return isinstance(content, str) and bool(_INTER_SESSION_INJECTION_RE.match(content))
+
+
+def _filter_compacted_messages(
+    messages: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Remove consumed inter-session rows and duplicate user content.
+
+    The exact-content hash is intentionally scoped to user rows: inter-session
+    deliveries are user-role injections, while repeated assistant/tool content
+    is legitimate conversation state and must not be collapsed.
+    """
+    filtered: List[Dict[str, Any]] = []
+    seen_user_content: set[bytes] = set()
+    for message in messages:
+        if _is_inter_session_injection(message):
+            continue
+        if message.get("role") == "user" and isinstance(message.get("content"), str):
+            digest = hashlib.sha256(message["content"].encode("utf-8")).digest()
+            if digest in seen_user_content:
+                continue
+            seen_user_content.add(digest)
+        filtered.append(message)
+    return filtered
+
+
 _SUMMARY_PERMANENT_QUOTA_MARKERS: tuple[str, ...] = (
     "insufficient_quota",
     "quota exceeded",
@@ -6961,6 +7002,13 @@ This compaction should PRIORITISE preserving all information related to the focu
             stripped = self._strip_context_summary_handoff_message(msg)
             if stripped is not None:
                 tail_messages.append(stripped)
+
+        # Inter-session deliveries are consumed ephemera, not durable tail
+        # context. Apply this to both head and tail after stale handoffs have
+        # been unwrapped, then collapse exact duplicate user content as a
+        # defense against envelope variants the matcher does not recognize.
+        compressed = _filter_compacted_messages(compressed)
+        tail_messages = _filter_compacted_messages(tail_messages)
 
         _merge_summary_into_tail = False
         # last_head_role reads the assembled (post-strip) head; first_tail_role
